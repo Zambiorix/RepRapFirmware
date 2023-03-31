@@ -34,8 +34,10 @@ protected:
 private:
 #ifdef __LPC17xx__
 	static const size_t MaxHttpSessions = 2;            // maximum number of simultaneous HTTP sessions
+	static const size_t MaxKeepAliveConnections = 0;   	// maximum number of simultaneous keep-alive HTTP connections
 #else
 	static const size_t MaxHttpSessions = 8;			// maximum number of simultaneous HTTP sessions
+	static const size_t MaxKeepAliveConnections = 1;   	// maximum number of simultaneous keep-alive HTTP connections
 #endif
 	static const uint16_t WebMessageLength = 1460;		// maximum length of the web message we accept after decoding
 	static const size_t MaxCommandWords = 4;			// max number of space-separated words in the command
@@ -84,8 +86,10 @@ private:
 	void SendFile(const char *_ecv_array nameOfFileToSend, bool isWebFile) noexcept;
 	void SendGCodeReply() noexcept;
 	void SendJsonResponse(const char *_ecv_array command) noexcept;
-	bool GetJsonResponse(const char *_ecv_array request, OutputBuffer *&response, bool& keepOpen) noexcept;
+	bool GetJsonResponse(const char *_ecv_array request, OutputBuffer *&response) noexcept;
 	void ProcessMessage() noexcept;
+	void ProcessKeepAlive() noexcept;
+	void CleanupKeepAlive() noexcept;
 	void ProcessRequest() noexcept;
 	void RejectMessage(const char *_ecv_array s, unsigned int code = 500) noexcept;
 	bool SendFileInfo(bool quitEarly) noexcept;
@@ -122,6 +126,12 @@ private:
 	uint32_t postFileExpectedCrc;
 	time_t fileLastModified;
 	bool postFileGotCrc;
+
+	bool resetState;
+
+	bool keepAliveProcessed;
+	bool keepAlive;
+	static unsigned int keepAliveConnections;
 
 	// Keeping track of HTTP sessions
 	static HttpSession sessions[MaxHttpSessions];
