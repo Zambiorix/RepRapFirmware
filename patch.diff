@@ -1,0 +1,881 @@
+From 0ed038e1f7cd0722dc70d34101521303a7a82db0 Mon Sep 17 00:00:00 2001
+From: Gerd Van Zegbroeck <gerd@vanzegbroeck.net>
+Date: Fri, 31 Mar 2023 02:24:01 +0200
+Subject: [PATCH] implementing keep-alive
+
+---
+ src/Networking/HttpResponder.cpp | 203 +++++++++++++++++++++++++------
+ src/Networking/HttpResponder.h   |  12 +-
+ 2 files changed, 174 insertions(+), 41 deletions(-)
+
+diff --git a/src/Networking/HttpResponder.cpp b/src/Networking/HttpResponder.cpp
+index 1c6cf560..75724dc6 100644
+--- a/src/Networking/HttpResponder.cpp
++++ b/src/Networking/HttpResponder.cpp
+@@ -19,7 +19,7 @@ const size_t KoFirst = 3;
+ 
+ const char* const overflowResponse = "overflow";
+ const char* const badEscapeResponse = "bad escape";
+-const char serviceUnavailableResponse[] = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
++const char serviceUnavailableResponse[] = "HTTP/1.1 503 Service Unavailable\r\n";
+ static_assert(ARRAY_SIZE(serviceUnavailableResponse) <= OUTPUT_BUFFER_SIZE, "OUTPUT_BUFFER_SIZE too small");
+ 
+ const uint32_t HttpReceiveTimeout = 2000;
+@@ -49,13 +49,10 @@ bool HttpResponder::Accept(Socket *s, NetworkProtocol protocol) noexcept
+ 		skt = s;
+ 		timer = millis();
+ 
+-		// Reset the parse state variables
+-		clientPointer = 0;
+-		parseState = HttpParseState::doingCommandWord;
+-		numCommandWords = 0;
+-		numQualKeys = 0;
+-		numHeaderKeys = 0;
+-		commandWords[0] = clientMessage;
++		resetState = true;
++
++		keepAliveProcessed = false;
++		keepAlive = false;
+ 
+ 		if (reprap.Debug(moduleWebserver))
+ 		{
+@@ -76,6 +73,17 @@ bool HttpResponder::Spin() noexcept
+ 
+ 	case ResponderState::reading:
+ 		{
++			if (resetState) {
++				resetState = false;
++				// Reset the parse state variables
++				clientPointer = 0;
++				parseState = HttpParseState::doingCommandWord;
++				numCommandWords = 0;
++				numQualKeys = 0;
++				numHeaderKeys = 0;
++				commandWords[0] = clientMessage;
++			}
++
+ 			bool readSomething = false;
+ 			char c;
+ 			while (skt->ReadChar(c))
+@@ -97,6 +105,7 @@ bool HttpResponder::Spin() noexcept
+ 
+ 			if (!skt->CanRead() || millis() - timer >= HttpReceiveTimeout)
+ 			{
++				CleanupKeepAlive();
+ 				ConnectionLost();
+ 				return true;
+ 			}
+@@ -451,9 +460,8 @@ bool HttpResponder::CharFromClient(char c) noexcept
+ // 'value' is null-terminated, but we also pass its length in case it contains embedded nulls, which matters when uploading files.
+ // Return true if we generated a json response to send, false if we didn't and changed the state instead.
+ // This may also return true with response == nullptr if we tried to generate a response but ran out of buffers.
+-bool HttpResponder::GetJsonResponse(const char *_ecv_array request, OutputBuffer *&response, bool& keepOpen) noexcept
++bool HttpResponder::GetJsonResponse(const char *_ecv_array request, OutputBuffer *&response) noexcept
+ {
+-	keepOpen = false;	// assume we don't want to persist the connection
+ 	const char *parameter;
+ 	if (StringEqualsIgnoreCase(request, "connect") && (parameter = GetKeyValue("password")) != nullptr)
+ 	{
+@@ -687,7 +695,10 @@ bool HttpResponder::SendFileInfo(bool quitEarly) noexcept
+ 					);
+ 		outBuf->catf("Content-Length: %u\r\n", (jsonResponse != nullptr) ? jsonResponse->Length() : 0);
+ 		AddCorsHeader();
+-		outBuf->cat("Connection: close\r\n\r\n");
++
++		outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
++		outBuf->cat("\r\n");
++
+ 		outBuf->Append(jsonResponse);
+ 		if (outBuf->HadOverflow())
+ 		{
+@@ -698,7 +709,8 @@ bool HttpResponder::SendFileInfo(bool quitEarly) noexcept
+ 		else
+ 		{
+ 			filenameBeingProcessed.Clear();
+-			Commit();
++			resetState = true;
++			Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
+ 		}
+ 	}
+ 	return gotFileInfo;
+@@ -912,8 +924,12 @@ void HttpResponder::SendFile(const char *_ecv_array nameOfFileToSend, bool isWeb
+ 	}
+ 
+ 	outBuf->catf("Content-Length: %lu\r\n", fileToSend->Length());
+-	outBuf->cat("Connection: close\r\n\r\n");
+-	Commit();
++
++	outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
++	outBuf->cat("\r\n");
++
++	resetState = true;
++	Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
+ #else
+ 	RejectMessage("file not found", 404);
+ #endif
+@@ -956,7 +972,10 @@ void HttpResponder::SendGCodeReply() noexcept
+ 					);
+ 		outBuf->catf("Content-Length: %u\r\n", gcodeReply.DataLength());
+ 		AddCorsHeader();
+-		outBuf->cat("Connection: close\r\n\r\n");
++
++		outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
++		outBuf->cat("\r\n");
++
+ 		outStack.Append(gcodeReply);
+ 
+ 		// Possibly clean up the G-code reply once again
+@@ -966,7 +985,8 @@ void HttpResponder::SendGCodeReply() noexcept
+ 		}
+ 	}
+ 
+-	Commit();
++	resetState = true;
++	Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
+ }
+ 
+ // Send a JSON response to the current command. outBuf is non-null on entry.
+@@ -1002,10 +1022,9 @@ void HttpResponder::SendJsonResponse(const char *_ecv_array command) noexcept
+ 
+ 	// Try to process a request for JSON responses
+ 	OutputBuffer *jsonResponse;
+-	bool mayKeepOpen;
+ 	if (OutputBuffer::Allocate(jsonResponse))
+ 	{
+-		const bool gotResponse = GetJsonResponse(command, jsonResponse, mayKeepOpen);
++		const bool gotResponse = GetJsonResponse(command, jsonResponse);
+ 		if (!gotResponse)
+ 		{
+ 			// GetJsonResponse() changed the state instead of returning a response
+@@ -1027,25 +1046,16 @@ void HttpResponder::SendJsonResponse(const char *_ecv_array command) noexcept
+ 
+ 		// We know that we have an output buffer, but it may be too short to send a long reply, so send a short one
+ 		outBuf->copy(serviceUnavailableResponse);
+-		Commit(ResponderState::free, false);
++
++		outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
++		outBuf->cat("\r\n");
++
++		resetState = true;
++		Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
+ 		return;
+ 	}
+ 
+ 	// Send the JSON response
+-	bool keepOpen = false;
+-	if (mayKeepOpen)
+-	{
+-		// Check that the browser wants to persist the connection too
+-		for (size_t i = 0; i < numHeaderKeys; ++i)
+-		{
+-			if (StringEqualsIgnoreCase(headers[i].key, "Connection"))
+-			{
+-				// Comment out the following line to disable persistent connections
+-				keepOpen = StringEqualsIgnoreCase(headers[i].value, "keep-alive");
+-				break;
+-			}
+-		}
+-	}
+ 
+ 	// Note that when using RTOS the following response should preferably be small enough to fit in a single buffer.
+ 	// This is because the current task may get suspended e.g. when reading from SD card to build a file list,
+@@ -1061,7 +1071,11 @@ void HttpResponder::SendJsonResponse(const char *_ecv_array command) noexcept
+ 	const unsigned int replyLength = (jsonResponse != nullptr) ? jsonResponse->Length() : 0;
+ 	outBuf->catf("Content-Length: %u\r\n", replyLength);
+ 	AddCorsHeader();
+-	outBuf->catf("Connection: %s\r\n\r\n", keepOpen ? "keep-alive" : "close");
++
++	outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
++
++	outBuf->cat("\r\n");
++
+ 	outBuf->Append(jsonResponse);
+ 
+ 	if (outBuf->HadOverflow())
+@@ -1072,12 +1086,18 @@ void HttpResponder::SendJsonResponse(const char *_ecv_array command) noexcept
+ 
+ 		// We know that we have an output buffer, but it may be too short to send a long reply, so send a short one
+ 		outBuf->copy(serviceUnavailableResponse);
+-		Commit(ResponderState::free, false);
++
++		outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
++		outBuf->cat("\r\n");
++
++		resetState = true;
++		Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
+ 		return;
+ 	}
+ 
+ 	// Here if everything is OK
+-	Commit(keepOpen ? ResponderState::reading : ResponderState::free, false);
++	resetState = true;
++	Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
+ 	if (reprap.Debug(moduleWebserver))
+ 	{
+ 		debugPrintf("Sending JSON reply, length %u\n", replyLength);
+@@ -1108,9 +1128,99 @@ void HttpResponder::ProcessMessage() noexcept
+ 	startedProcessingRequestAt = millis();
+ }
+ 
++// Process keep-alive
++void HttpResponder::ProcessKeepAlive() noexcept
++{
++	if (keepAliveProcessed) {
++
++		if (keepAlive) {
++
++			bool close = true;
++
++			for (size_t i = 0; i < numHeaderKeys; i++)
++			{
++				if (StringEqualsIgnoreCase(headers[i].key, "Connection"))
++				{
++					if (StringEqualsIgnoreCase(headers[i].value, "keep-alive")) {
++
++						close = false;
++					}
++
++					break;
++				}
++			}
++
++			if (close) {
++
++				keepAlive = false;
++
++				if (keepAliveConnections > 0) {
++
++					--keepAliveConnections;
++				}
++			}
++		}
++
++		return;
++	}
++
++	keepAliveProcessed = true;
++
++	if (keepAliveConnections >= MaxKeepAliveConnections) {
++
++		return;
++	}
++
++	bool keepAliveHeader = false;
++
++	for (size_t i = 0; i < numHeaderKeys; i++)
++	{
++		if (StringEqualsIgnoreCase(headers[i].key, "Connection"))
++		{
++			keepAliveHeader = StringEqualsIgnoreCase(headers[i].value, "keep-alive");
++
++			break;
++		}
++	}
++
++	bool keepAliveHeaderRRF = false;
++
++	for (size_t i = 0; i < numHeaderKeys; i++)
++	{
++		if (StringEqualsIgnoreCase(headers[i].key, "Rrf-Keep-Alive"))
++		{
++			keepAliveHeaderRRF = StringEqualsIgnoreCase(headers[i].value, "force");
++
++			break;
++		}
++	}
++
++	if (keepAliveHeader && keepAliveHeaderRRF) {
++
++		keepAlive = true;
++
++		keepAliveConnections++;
++	}
++}
++
++// Cleanup active keep-alive
++void HttpResponder::CleanupKeepAlive() noexcept
++{
++	if (keepAliveProcessed && keepAlive) {
++
++		keepAlive = false;
++
++		if (keepAliveConnections > 0) {
++
++			--keepAliveConnections;
++		}
++	}
++}
++
+ // Process the message received. We have reached the end of the headers.
+ void HttpResponder::ProcessRequest() noexcept
+ {
++
+ 	if (numCommandWords < 2)
+ 	{
+ 		RejectMessage("too few command words");
+@@ -1120,6 +1230,8 @@ void HttpResponder::ProcessRequest() noexcept
+ 	// Reserve an output buffer before we process the request, or we won't be able to reply
+ 	if (outBuf != nullptr || OutputBuffer::Allocate(outBuf))
+ 	{
++		ProcessKeepAlive();
++
+ 		if (StringEqualsIgnoreCase(commandWords[0], "GET"))
+ 		{
+ 			if (StringStartsWith(commandWords[1], KO_START))
+@@ -1151,7 +1263,10 @@ void HttpResponder::ProcessRequest() noexcept
+ 				outBuf->catf("Access-Control-Allow-Headers: Content-Type\r\n");
+ 				AddCorsHeader();
+ 			}
++
++			outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
+ 			outBuf->cat("\r\n");
++
+ 			if (outBuf->HadOverflow())
+ 			{
+ 				OutputBuffer::ReleaseAll(outBuf);
+@@ -1159,7 +1274,8 @@ void HttpResponder::ProcessRequest() noexcept
+ 			}
+ 			else
+ 			{
+-				Commit();
++				resetState = true;
++				Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
+ 			}
+ 			return;
+ 		}
+@@ -1276,11 +1392,14 @@ void HttpResponder::RejectMessage(const char *_ecv_array response, unsigned int
+ 
+ 	if (outBuf != nullptr || OutputBuffer::Allocate(outBuf))
+ 	{
+-		outBuf->printf("HTTP/1.1 %u %s\r\n"
+-					   "Connection: close\r\n", code, response);
++		outBuf->printf("HTTP/1.1 %u %s\r\n", code, response);
++
++		outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
++
+ 		AddCorsHeader();
+ 		outBuf->catf("\r\n%s%s%s", ErrorPagePart1, response, ErrorPagePart2);
+-		Commit();
++		resetState = true;
++		Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
+ 	}
+ 	else
+ 	{
+@@ -1321,6 +1440,7 @@ void HttpResponder::DoUpload() noexcept
+ 	else if (!skt->CanRead() || millis() - timer >= HttpSessionTimeout)
+ 	{
+ 		// Sometimes uploads can get stuck; make sure they are cancelled when that happens
++		CleanupKeepAlive();
+ 		ConnectionLost();
+ 		return;
+ 	}
+@@ -1352,6 +1472,7 @@ void HttpResponder::Terminate(NetworkProtocol protocol, NetworkInterface *interf
+ {
+ 	if (responderState != ResponderState::free && (protocol == HttpProtocol || protocol == AnyProtocol) && skt != nullptr && skt->GetInterface() == interface)
+ 	{
++		CleanupKeepAlive();
+ 		ConnectionLost();
+ 	}
+ }
+@@ -1401,6 +1522,7 @@ void HttpResponder::Diagnostics(MessageType mt) const noexcept
+ 
+ 	clientsServed = 0;
+ 	numSessions = 0;
++	keepAliveConnections = 0;
+ 	gcodeReply.ReleaseAll();
+ }
+ 
+@@ -1526,6 +1648,7 @@ void HttpResponder::AddCorsHeader() noexcept
+ HttpResponder::HttpSession HttpResponder::sessions[MaxHttpSessions];
+ unsigned int HttpResponder::numSessions = 0;
+ unsigned int HttpResponder::clientsServed = 0;
++unsigned int HttpResponder::keepAliveConnections = 0;
+ 
+ volatile uint16_t HttpResponder::seq = 0;
+ volatile OutputStack HttpResponder::gcodeReply;
+diff --git a/src/Networking/HttpResponder.h b/src/Networking/HttpResponder.h
+index 1e26726b..7b64a8ce 100644
+--- a/src/Networking/HttpResponder.h
++++ b/src/Networking/HttpResponder.h
+@@ -34,8 +34,10 @@ protected:
+ private:
+ #ifdef __LPC17xx__
+ 	static const size_t MaxHttpSessions = 2;            // maximum number of simultaneous HTTP sessions
++	static const size_t MaxKeepAliveConnections = 0;   	// maximum number of simultaneous keep-alive HTTP connections
+ #else
+ 	static const size_t MaxHttpSessions = 8;			// maximum number of simultaneous HTTP sessions
++	static const size_t MaxKeepAliveConnections = 1;   	// maximum number of simultaneous keep-alive HTTP connections
+ #endif
+ 	static const uint16_t WebMessageLength = 1460;		// maximum length of the web message we accept after decoding
+ 	static const size_t MaxCommandWords = 4;			// max number of space-separated words in the command
+@@ -84,8 +86,10 @@ private:
+ 	void SendFile(const char *_ecv_array nameOfFileToSend, bool isWebFile) noexcept;
+ 	void SendGCodeReply() noexcept;
+ 	void SendJsonResponse(const char *_ecv_array command) noexcept;
+-	bool GetJsonResponse(const char *_ecv_array request, OutputBuffer *&response, bool& keepOpen) noexcept;
++	bool GetJsonResponse(const char *_ecv_array request, OutputBuffer *&response) noexcept;
+ 	void ProcessMessage() noexcept;
++	void ProcessKeepAlive() noexcept;
++	void CleanupKeepAlive() noexcept;
+ 	void ProcessRequest() noexcept;
+ 	void RejectMessage(const char *_ecv_array s, unsigned int code = 500) noexcept;
+ 	bool SendFileInfo(bool quitEarly) noexcept;
+@@ -123,6 +127,12 @@ private:
+ 	time_t fileLastModified;
+ 	bool postFileGotCrc;
+ 
++	bool resetState;
++
++	bool keepAliveProcessed;
++	bool keepAlive;
++	static unsigned int keepAliveConnections;
++
+ 	// Keeping track of HTTP sessions
+ 	static HttpSession sessions[MaxHttpSessions];
+ 	static unsigned int numSessions;
+-- 
+2.37.0
+
+From c4cf2cd7a47e5c4e87cf27dc670cd0c8a978a821 Mon Sep 17 00:00:00 2001
+From: Gerd Van Zegbroeck <gerd@vanzegbroeck.net>
+Date: Thu, 6 Apr 2023 12:04:08 +0200
+Subject: [PATCH] improving keep-alive
+
+---
+ src/Networking/HttpResponder.cpp | 177 ++++++++++++++++---------------
+ src/Networking/HttpResponder.h   |   9 +-
+ 2 files changed, 98 insertions(+), 88 deletions(-)
+
+diff --git a/src/Networking/HttpResponder.cpp b/src/Networking/HttpResponder.cpp
+index 75724dc6..7c33ab33 100644
+--- a/src/Networking/HttpResponder.cpp
++++ b/src/Networking/HttpResponder.cpp
+@@ -47,13 +47,12 @@ bool HttpResponder::Accept(Socket *s, NetworkProtocol protocol) noexcept
+ 	{
+ 		responderState = ResponderState::reading;
+ 		skt = s;
+-		timer = millis();
+ 
+-		resetState = true;
+-
+-		keepAliveProcessed = false;
++		keepAliveInitialized = false;
+ 		keepAlive = false;
+ 
++		ResetParserState();
++
+ 		if (reprap.Debug(moduleWebserver))
+ 		{
+ 			debugPrintf("HTTP connection accepted\n");
+@@ -63,6 +62,21 @@ bool HttpResponder::Accept(Socket *s, NetworkProtocol protocol) noexcept
+ 	return false;
+ }
+ 
++// This is called when we lose a connection or when we are asked to terminate. Overridden in some derived classes.
++void HttpResponder::ConnectionLost() noexcept
++{
++	if (keepAliveInitialized && keepAlive) {
++
++		keepAlive = false;
++
++		if (keepAliveConnections > 0) {
++			keepAliveConnections--;
++		}
++	}
++
++	UploadingNetworkResponder::ConnectionLost();
++}
++
+ // Do some work, returning true if we did anything significant
+ bool HttpResponder::Spin() noexcept
+ {
+@@ -73,17 +87,6 @@ bool HttpResponder::Spin() noexcept
+ 
+ 	case ResponderState::reading:
+ 		{
+-			if (resetState) {
+-				resetState = false;
+-				// Reset the parse state variables
+-				clientPointer = 0;
+-				parseState = HttpParseState::doingCommandWord;
+-				numCommandWords = 0;
+-				numQualKeys = 0;
+-				numHeaderKeys = 0;
+-				commandWords[0] = clientMessage;
+-			}
+-
+ 			bool readSomething = false;
+ 			char c;
+ 			while (skt->ReadChar(c))
+@@ -105,7 +108,6 @@ bool HttpResponder::Spin() noexcept
+ 
+ 			if (!skt->CanRead() || millis() - timer >= HttpReceiveTimeout)
+ 			{
+-				CleanupKeepAlive();
+ 				ConnectionLost();
+ 				return true;
+ 			}
+@@ -136,6 +138,35 @@ bool HttpResponder::Spin() noexcept
+ 	}
+ }
+ 
++// Resets parser state (on accept and after every keep-alive request)
++void HttpResponder::ResetParserState() noexcept
++{
++	timer = millis();
++
++	clientPointer = 0;
++	parseState = HttpParseState::doingCommandWord;
++	numCommandWords = 0;
++	numQualKeys = 0;
++	numHeaderKeys = 0;
++	commandWords[0] = clientMessage;
++}
++
++// Finish request, free responder state or start reading again when keep-alive is active
++void HttpResponder::CloseOrWaitForNewCommand() noexcept
++{
++	if (keepAlive) {
++
++		ResetParserState();
++
++		Commit(ResponderState::reading, false);
++
++	} else {
++
++		Commit();
++	}
++}
++
++
+ // Process a character from the client
+ // Rewritten as a state machine by dc42 to increase capability and speed, and reduce RAM requirement.
+ // On entry:
+@@ -694,9 +725,8 @@ bool HttpResponder::SendFileInfo(bool quitEarly) noexcept
+ 						"Content-Type: application/json\r\n"
+ 					);
+ 		outBuf->catf("Content-Length: %u\r\n", (jsonResponse != nullptr) ? jsonResponse->Length() : 0);
+-		AddCorsHeader();
+-
+ 		outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
++		AddCorsHeader();
+ 		outBuf->cat("\r\n");
+ 
+ 		outBuf->Append(jsonResponse);
+@@ -709,8 +739,7 @@ bool HttpResponder::SendFileInfo(bool quitEarly) noexcept
+ 		else
+ 		{
+ 			filenameBeingProcessed.Clear();
+-			resetState = true;
+-			Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
++			CloseOrWaitForNewCommand();
+ 		}
+ 	}
+ 	return gotFileInfo;
+@@ -924,12 +953,10 @@ void HttpResponder::SendFile(const char *_ecv_array nameOfFileToSend, bool isWeb
+ 	}
+ 
+ 	outBuf->catf("Content-Length: %lu\r\n", fileToSend->Length());
+-
+ 	outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
+ 	outBuf->cat("\r\n");
+ 
+-	resetState = true;
+-	Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
++	CloseOrWaitForNewCommand();
+ #else
+ 	RejectMessage("file not found", 404);
+ #endif
+@@ -938,6 +965,7 @@ void HttpResponder::SendFile(const char *_ecv_array nameOfFileToSend, bool isWeb
+ void HttpResponder::SendGCodeReply() noexcept
+ {
+ 	{
++		// TODO clients can receive the same GCode Reply multiple times if other sessions are active and have not called for Reply?
+ 		// Do we need to keep the G-Code reply for other clients?
+ 		bool clearReply = false;
+ 		MutexLocker Lock(gcodeReplyMutex);
+@@ -971,9 +999,8 @@ void HttpResponder::SendGCodeReply() noexcept
+ 						"Content-Type: text/plain\r\n"
+ 					);
+ 		outBuf->catf("Content-Length: %u\r\n", gcodeReply.DataLength());
+-		AddCorsHeader();
+-
+ 		outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
++		AddCorsHeader();
+ 		outBuf->cat("\r\n");
+ 
+ 		outStack.Append(gcodeReply);
+@@ -985,8 +1012,7 @@ void HttpResponder::SendGCodeReply() noexcept
+ 		}
+ 	}
+ 
+-	resetState = true;
+-	Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
++	CloseOrWaitForNewCommand();
+ }
+ 
+ // Send a JSON response to the current command. outBuf is non-null on entry.
+@@ -1046,12 +1072,10 @@ void HttpResponder::SendJsonResponse(const char *_ecv_array command) noexcept
+ 
+ 		// We know that we have an output buffer, but it may be too short to send a long reply, so send a short one
+ 		outBuf->copy(serviceUnavailableResponse);
+-
+ 		outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
+ 		outBuf->cat("\r\n");
+ 
+-		resetState = true;
+-		Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
++		CloseOrWaitForNewCommand();
+ 		return;
+ 	}
+ 
+@@ -1070,10 +1094,8 @@ void HttpResponder::SendJsonResponse(const char *_ecv_array command) noexcept
+ 				);
+ 	const unsigned int replyLength = (jsonResponse != nullptr) ? jsonResponse->Length() : 0;
+ 	outBuf->catf("Content-Length: %u\r\n", replyLength);
+-	AddCorsHeader();
+-
+ 	outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
+-
++	AddCorsHeader();
+ 	outBuf->cat("\r\n");
+ 
+ 	outBuf->Append(jsonResponse);
+@@ -1086,18 +1108,15 @@ void HttpResponder::SendJsonResponse(const char *_ecv_array command) noexcept
+ 
+ 		// We know that we have an output buffer, but it may be too short to send a long reply, so send a short one
+ 		outBuf->copy(serviceUnavailableResponse);
+-
+ 		outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
+ 		outBuf->cat("\r\n");
+ 
+-		resetState = true;
+-		Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
++		CloseOrWaitForNewCommand();
+ 		return;
+ 	}
+ 
+ 	// Here if everything is OK
+-	resetState = true;
+-	Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
++	CloseOrWaitForNewCommand();
+ 	if (reprap.Debug(moduleWebserver))
+ 	{
+ 		debugPrintf("Sending JSON reply, length %u\n", replyLength);
+@@ -1128,14 +1147,16 @@ void HttpResponder::ProcessMessage() noexcept
+ 	startedProcessingRequestAt = millis();
+ }
+ 
+-// Process keep-alive
++// Check and maintain keep-alive connections
+ void HttpResponder::ProcessKeepAlive() noexcept
+ {
+-	if (keepAliveProcessed) {
++	// for subsequent requests, check if we need to keep keep-alive
++
++	if (keepAliveInitialized) {
+ 
+ 		if (keepAlive) {
+ 
+-			bool close = true;
++			bool closeWhenDone = true;
+ 
+ 			for (size_t i = 0; i < numHeaderKeys; i++)
+ 			{
+@@ -1143,14 +1164,14 @@ void HttpResponder::ProcessKeepAlive() noexcept
+ 				{
+ 					if (StringEqualsIgnoreCase(headers[i].value, "keep-alive")) {
+ 
+-						close = false;
++						closeWhenDone = false;
+ 					}
+ 
+ 					break;
+ 				}
+ 			}
+ 
+-			if (close) {
++			if (closeWhenDone) {
+ 
+ 				keepAlive = false;
+ 
+@@ -1164,55 +1185,38 @@ void HttpResponder::ProcessKeepAlive() noexcept
+ 		return;
+ 	}
+ 
+-	keepAliveProcessed = true;
++	keepAliveInitialized = true;
++
++	// make sure we don't go over max allowed keep-alive connections
+ 
+ 	if (keepAliveConnections >= MaxKeepAliveConnections) {
+ 
+ 		return;
+ 	}
+ 
++	// check if we have a keep-alive connection header and keep-alive is forced
++	// (browsers are not allowed to have keep-alive enabled, to keep resource use in check)
++
+ 	bool keepAliveHeader = false;
++	bool keepAliveHeaderRRF = false;
+ 
+ 	for (size_t i = 0; i < numHeaderKeys; i++)
+ 	{
+-		if (StringEqualsIgnoreCase(headers[i].key, "Connection"))
++		if (!keepAliveHeader && StringEqualsIgnoreCase(headers[i].key, "Connection"))
+ 		{
+ 			keepAliveHeader = StringEqualsIgnoreCase(headers[i].value, "keep-alive");
+-
+-			break;
+ 		}
+-	}
+-
+-	bool keepAliveHeaderRRF = false;
+-
+-	for (size_t i = 0; i < numHeaderKeys; i++)
+-	{
+-		if (StringEqualsIgnoreCase(headers[i].key, "Rrf-Keep-Alive"))
++		else if (!keepAliveHeaderRRF && StringEqualsIgnoreCase(headers[i].key, "Rrf-Keep-Alive"))
+ 		{
+ 			keepAliveHeaderRRF = StringEqualsIgnoreCase(headers[i].value, "force");
+-
+-			break;
+ 		}
+-	}
+-
+-	if (keepAliveHeader && keepAliveHeaderRRF) {
+-
+-		keepAlive = true;
+-
+-		keepAliveConnections++;
+-	}
+-}
+-
+-// Cleanup active keep-alive
+-void HttpResponder::CleanupKeepAlive() noexcept
+-{
+-	if (keepAliveProcessed && keepAlive) {
+-
+-		keepAlive = false;
++		else if (keepAliveHeader && keepAliveHeaderRRF)
++		{
++			keepAlive = true;
+ 
+-		if (keepAliveConnections > 0) {
++			keepAliveConnections++;
+ 
+-			--keepAliveConnections;
++			break;
+ 		}
+ 	}
+ }
+@@ -1227,11 +1231,11 @@ void HttpResponder::ProcessRequest() noexcept
+ 		return;
+ 	}
+ 
++	ProcessKeepAlive();
++
+ 	// Reserve an output buffer before we process the request, or we won't be able to reply
+ 	if (outBuf != nullptr || OutputBuffer::Allocate(outBuf))
+ 	{
+-		ProcessKeepAlive();
+-
+ 		if (StringEqualsIgnoreCase(commandWords[0], "GET"))
+ 		{
+ 			if (StringStartsWith(commandWords[1], KO_START))
+@@ -1274,8 +1278,7 @@ void HttpResponder::ProcessRequest() noexcept
+ 			}
+ 			else
+ 			{
+-				resetState = true;
+-				Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
++				CloseOrWaitForNewCommand();
+ 			}
+ 			return;
+ 		}
+@@ -1390,16 +1393,24 @@ void HttpResponder::RejectMessage(const char *_ecv_array response, unsigned int
+ 		GetPlatform().MessageF(UsbMessage, "Webserver: rejecting message with: %u %s\n", code, response);
+ 	}
+ 
++	// this request failed, so we cannot keep the connection alive to avoid parsing erroneous data hereafter
++	if (keepAliveInitialized && keepAlive) {
++
++		keepAlive = false;
++
++		if (keepAliveConnections > 0) {
++			keepAliveConnections--;
++		}
++	}
++
+ 	if (outBuf != nullptr || OutputBuffer::Allocate(outBuf))
+ 	{
+ 		outBuf->printf("HTTP/1.1 %u %s\r\n", code, response);
+-
+ 		outBuf->catf("Connection: %s\r\n", keepAlive ? "keep-alive" : "close");
+-
+ 		AddCorsHeader();
+ 		outBuf->catf("\r\n%s%s%s", ErrorPagePart1, response, ErrorPagePart2);
+-		resetState = true;
+-		Commit(keepAlive ? ResponderState::reading : ResponderState::free, false);
++
++		CloseOrWaitForNewCommand();
+ 	}
+ 	else
+ 	{
+@@ -1440,7 +1451,6 @@ void HttpResponder::DoUpload() noexcept
+ 	else if (!skt->CanRead() || millis() - timer >= HttpSessionTimeout)
+ 	{
+ 		// Sometimes uploads can get stuck; make sure they are cancelled when that happens
+-		CleanupKeepAlive();
+ 		ConnectionLost();
+ 		return;
+ 	}
+@@ -1472,7 +1482,6 @@ void HttpResponder::Terminate(NetworkProtocol protocol, NetworkInterface *interf
+ {
+ 	if (responderState != ResponderState::free && (protocol == HttpProtocol || protocol == AnyProtocol) && skt != nullptr && skt->GetInterface() == interface)
+ 	{
+-		CleanupKeepAlive();
+ 		ConnectionLost();
+ 	}
+ }
+diff --git a/src/Networking/HttpResponder.h b/src/Networking/HttpResponder.h
+index 7b64a8ce..62cccf13 100644
+--- a/src/Networking/HttpResponder.h
++++ b/src/Networking/HttpResponder.h
+@@ -78,10 +78,14 @@ private:
+ 		uint16_t postPort;
+ 	};
+ 
++	void ResetParserState() noexcept;
++	void CloseOrWaitForNewCommand() noexcept;
++
+ 	bool Authenticate() noexcept;
+ 	bool CheckAuthenticated() noexcept;
+ 	bool RemoveAuthentication() noexcept;
+ 
++	void ConnectionLost() noexcept override;
+ 	bool CharFromClient(char c) noexcept;
+ 	void SendFile(const char *_ecv_array nameOfFileToSend, bool isWebFile) noexcept;
+ 	void SendGCodeReply() noexcept;
+@@ -89,7 +93,6 @@ private:
+ 	bool GetJsonResponse(const char *_ecv_array request, OutputBuffer *&response) noexcept;
+ 	void ProcessMessage() noexcept;
+ 	void ProcessKeepAlive() noexcept;
+-	void CleanupKeepAlive() noexcept;
+ 	void ProcessRequest() noexcept;
+ 	void RejectMessage(const char *_ecv_array s, unsigned int code = 500) noexcept;
+ 	bool SendFileInfo(bool quitEarly) noexcept;
+@@ -127,9 +130,7 @@ private:
+ 	time_t fileLastModified;
+ 	bool postFileGotCrc;
+ 
+-	bool resetState;
+-
+-	bool keepAliveProcessed;
++	bool keepAliveInitialized;
+ 	bool keepAlive;
+ 	static unsigned int keepAliveConnections;
+ 
+-- 
+2.37.0
+
