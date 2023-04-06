@@ -78,10 +78,14 @@ private:
 		uint16_t postPort;
 	};
 
+	void ResetParserState() noexcept;
+	void CloseOrWaitForNewCommand() noexcept;
+
 	bool Authenticate() noexcept;
 	bool CheckAuthenticated() noexcept;
 	bool RemoveAuthentication() noexcept;
 
+	void ConnectionLost() noexcept override;
 	bool CharFromClient(char c) noexcept;
 	void SendFile(const char *_ecv_array nameOfFileToSend, bool isWebFile) noexcept;
 	void SendGCodeReply() noexcept;
@@ -89,7 +93,6 @@ private:
 	bool GetJsonResponse(const char *_ecv_array request, OutputBuffer *&response) noexcept;
 	void ProcessMessage() noexcept;
 	void ProcessKeepAlive() noexcept;
-	void CleanupKeepAlive() noexcept;
 	void ProcessRequest() noexcept;
 	void RejectMessage(const char *_ecv_array s, unsigned int code = 500) noexcept;
 	bool SendFileInfo(bool quitEarly) noexcept;
@@ -127,9 +130,7 @@ private:
 	time_t fileLastModified;
 	bool postFileGotCrc;
 
-	bool resetState;
-
-	bool keepAliveProcessed;
+	bool keepAliveInitialized;
 	bool keepAlive;
 	static unsigned int keepAliveConnections;
 
